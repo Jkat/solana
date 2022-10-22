@@ -8,11 +8,12 @@ use {
     rand::Rng,
     rayon::iter::{IntoParallelRefIterator, ParallelIterator},
     solana_runtime::{
-        accounts::{create_test_accounts, AccountAddressFilter, Accounts},
+        accounts::{test_utils::create_test_accounts, AccountAddressFilter, Accounts},
         accounts_db::AccountShrinkThreshold,
         accounts_index::{AccountSecondaryIndexes, ScanConfig},
         ancestors::Ancestors,
         bank::*,
+        rent_collector::RentCollector,
     },
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
@@ -20,6 +21,7 @@ use {
         hash::Hash,
         lamports::LamportsError,
         pubkey::Pubkey,
+        sysvar::epoch_schedule::EpochSchedule,
     },
     std::{
         collections::{HashMap, HashSet},
@@ -46,16 +48,7 @@ fn deposit_many(bank: &Bank, pubkeys: &mut Vec<Pubkey>, num: usize) -> Result<()
 #[bench]
 fn test_accounts_create(bencher: &mut Bencher) {
     let (genesis_config, _) = create_genesis_config(10_000);
-    let bank0 = Bank::new_with_paths_for_benches(
-        &genesis_config,
-        vec![PathBuf::from("bench_a0")],
-        None,
-        None,
-        AccountSecondaryIndexes::default(),
-        false,
-        AccountShrinkThreshold::default(),
-        false,
-    );
+    let bank0 = Bank::new_with_paths_for_benches(&genesis_config, vec![PathBuf::from("bench_a0")]);
     bencher.iter(|| {
         let mut pubkeys: Vec<Pubkey> = vec![];
         deposit_many(&bank0, &mut pubkeys, 1000).unwrap();
@@ -69,12 +62,6 @@ fn test_accounts_squash(bencher: &mut Bencher) {
     let mut prev_bank = Arc::new(Bank::new_with_paths_for_benches(
         &genesis_config,
         vec![PathBuf::from("bench_a1")],
-        None,
-        None,
-        AccountSecondaryIndexes::default(),
-        false,
-        AccountShrinkThreshold::default(),
-        false,
     ));
     let mut pubkeys: Vec<Pubkey> = vec![];
     deposit_many(&prev_bank, &mut pubkeys, 250_000).unwrap();
@@ -107,14 +94,24 @@ fn test_accounts_hash_bank_hash(bencher: &mut Bencher) {
     let slot = 0;
     create_test_accounts(&accounts, &mut pubkeys, num_accounts, slot);
     let ancestors = Ancestors::from(vec![0]);
-    let (_, total_lamports) = accounts.accounts_db.update_accounts_hash(0, &ancestors);
+    let (_, total_lamports) = accounts.accounts_db.update_accounts_hash(
+        0,
+        &ancestors,
+        &EpochSchedule::default(),
+        &RentCollector::default(),
+    );
     let test_hash_calculation = false;
     bencher.iter(|| {
         assert!(accounts.verify_bank_hash_and_lamports(
             0,
             &ancestors,
             total_lamports,
-            test_hash_calculation
+            test_hash_calculation,
+            &EpochSchedule::default(),
+            &RentCollector::default(),
+            false,
+            false,
+            false,
         ))
     });
 }
@@ -133,7 +130,12 @@ fn test_update_accounts_hash(bencher: &mut Bencher) {
     create_test_accounts(&accounts, &mut pubkeys, 50_000, 0);
     let ancestors = Ancestors::from(vec![0]);
     bencher.iter(|| {
-        accounts.accounts_db.update_accounts_hash(0, &ancestors);
+        accounts.accounts_db.update_accounts_hash(
+            0,
+            &ancestors,
+            &EpochSchedule::default(),
+            &RentCollector::default(),
+        );
     });
 }
 
@@ -176,7 +178,7 @@ fn bench_delete_dependencies(bencher: &mut Bencher) {
         accounts.add_root(i);
     }
     bencher.iter(|| {
-        accounts.accounts_db.clean_accounts(None, false, None);
+        accounts.accounts_db.clean_accounts_for_tests();
     });
 }
 

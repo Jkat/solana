@@ -1,18 +1,24 @@
 #![allow(clippy::integer_arithmetic)]
+
 use {
     clap::{crate_description, crate_name, value_t, values_t_or_exit, App, Arg},
     log::*,
     rand::{thread_rng, Rng},
     rayon::prelude::*,
     solana_clap_utils::input_parsers::pubkey_of,
-    solana_cli::{cli::CliConfig, program::process_deploy},
-    solana_client::{rpc_client::RpcClient, transaction_executor::TransactionExecutor},
+    solana_cli::{
+        cli::{process_command, CliCommand, CliConfig},
+        program::ProgramCliCommand,
+    },
+    solana_client::transaction_executor::TransactionExecutor,
     solana_faucet::faucet::{request_airdrop_transaction, FAUCET_PORT},
     solana_gossip::gossip_service::discover,
+    solana_rpc_client::rpc_client::RpcClient,
     solana_sdk::{
         commitment_config::CommitmentConfig,
         instruction::{AccountMeta, Instruction},
         message::Message,
+        packet::PACKET_DATA_SIZE,
         pubkey::Pubkey,
         rpc_port::DEFAULT_RPC_PORT,
         signature::{read_keypair_file, Keypair, Signer},
@@ -131,6 +137,9 @@ fn make_dos_message(
     Message::new(&instructions, Some(&keypair.pubkey()))
 }
 
+/// creates large transactions that all touch the same set of accounts,
+/// so they can't be parallelized
+///
 #[allow(clippy::too_many_arguments)]
 fn run_transactions_dos(
     entrypoint_addr: SocketAddr,
@@ -174,7 +183,8 @@ fn run_transactions_dos(
 
     let program_account = client.get_account(&program_id);
 
-    let message = Message::new(
+    let mut blockhash = client.get_latest_blockhash().expect("blockhash");
+    let mut message = Message::new_with_blockhash(
         &[
             Instruction::new_with_bytes(
                 Pubkey::new_unique(),
@@ -188,12 +198,12 @@ fn run_transactions_dos(
             ),
         ],
         None,
+        &blockhash,
     );
 
     let mut latest_blockhash = Instant::now();
     let mut last_log = Instant::now();
     let mut count = 0;
-    let mut blockhash = client.get_latest_blockhash().expect("blockhash");
 
     if just_calculate_fees {
         let fee = client
@@ -222,23 +232,27 @@ fn run_transactions_dos(
     if program_account.is_err() {
         let mut config = CliConfig::default();
         let (program_keypair, program_location) = program_options
-            .as_ref()
             .expect("If the program doesn't exist, need to provide program keypair to deploy");
         info!(
             "processing deploy: {:?} key: {}",
             program_account,
             program_keypair.pubkey()
         );
-        config.signers = vec![payer_keypairs[0], program_keypair];
-        process_deploy(
-            client.clone(),
-            &config,
-            program_location,
-            Some(1),
-            false,
-            true,
-        )
-        .expect("deploy didn't pass");
+        config.signers = vec![payer_keypairs[0], &program_keypair];
+        config.command = CliCommand::Program(ProgramCliCommand::Deploy {
+            program_location: Some(program_location),
+            program_signer_index: Some(1),
+            program_pubkey: None,
+            buffer_signer_index: None,
+            buffer_pubkey: None,
+            allow_excessive_balance: true,
+            upgrade_authority_signer_index: 0,
+            is_final: true,
+            max_len: None,
+            skip_fee_check: true, // skip_fee_check
+        });
+
+        process_command(&config).expect("deploy didn't pass");
     } else {
         info!("Found program account. Skipping deploy..");
         assert!(program_account.unwrap().executable);
@@ -267,6 +281,7 @@ fn run_transactions_dos(
     loop {
         if latest_blockhash.elapsed().as_secs() > 10 {
             blockhash = client.get_latest_blockhash().expect("blockhash");
+            message.recent_blockhash = blockhash;
             latest_blockhash = Instant::now();
         }
 
@@ -378,7 +393,7 @@ fn run_transactions_dos(
                         let tx = Transaction::new(&signers, message, blockhash);
                         if !tested_size.load(Ordering::Relaxed) {
                             let ser_size = bincode::serialized_size(&tx).unwrap();
-                            assert!(ser_size < 1200, "{}", ser_size);
+                            assert!(ser_size < PACKET_DATA_SIZE as u64, "{}", ser_size);
                             tested_size.store(true, Ordering::Relaxed);
                         }
                         tx
@@ -657,7 +672,7 @@ pub mod test {
         let tx = Transaction::new(&signers, message, blockhash);
         let size = bincode::serialized_size(&tx).unwrap();
         info!("size:{}", size);
-        assert!(size < 1200);
+        assert!(size < PACKET_DATA_SIZE as u64);
     }
 
     #[test]
@@ -665,7 +680,7 @@ pub mod test {
     fn test_transaction_dos() {
         solana_logger::setup();
 
-        let validator_config = ValidatorConfig::default();
+        let validator_config = ValidatorConfig::default_for_test();
         let num_nodes = 1;
         let mut config = ClusterConfig {
             cluster_lamports: 10_000_000,
@@ -711,7 +726,11 @@ pub mod test {
             program_keypair.pubkey(),
             Some((
                 program_keypair,
-                String::from("../programs/bpf/c/out/tuner.so"),
+                format!(
+                    "{}{}",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../programs/sbf/c/out/tuner.so"
+                ),
             )),
             &account_keypair_refs,
             maybe_account_groups,

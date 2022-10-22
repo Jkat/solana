@@ -1,11 +1,14 @@
-//! Syscall stubs when building for programs for non-BPF targets
+//! Implementations of syscalls used when `solana-program` is built for non-BPF targets.
 
-#![cfg(not(target_arch = "bpf"))]
+#![cfg(not(target_os = "solana"))]
 
 use {
     crate::{
-        account_info::AccountInfo, entrypoint::ProgramResult, instruction::Instruction,
-        program_error::UNSUPPORTED_SYSVAR, pubkey::Pubkey,
+        account_info::AccountInfo,
+        entrypoint::ProgramResult,
+        instruction::{AccountPropertyUpdate, Instruction},
+        program_error::UNSUPPORTED_SYSVAR,
+        pubkey::Pubkey,
     },
     itertools::Itertools,
     std::sync::{Arc, RwLock},
@@ -91,6 +94,13 @@ pub trait SyscallStubs: Sync + Send {
     fn sol_log_data(&self, fields: &[&[u8]]) {
         println!("data: {}", fields.iter().map(base64::encode).join(" "));
     }
+    fn sol_get_processed_sibling_instruction(&self, _index: usize) -> Option<Instruction> {
+        None
+    }
+    fn sol_get_stack_height(&self) -> u64 {
+        0
+    }
+    fn sol_set_account_properties(&self, _updates: &[AccountPropertyUpdate]) {}
 }
 
 struct DefaultSyscallStubs {}
@@ -133,8 +143,8 @@ pub(crate) fn sol_get_epoch_schedule_sysvar(var_addr: *mut u8) -> u64 {
         .sol_get_epoch_schedule_sysvar(var_addr)
 }
 
-pub(crate) fn sol_get_fees_sysvar(_var_addr: *mut u8) -> u64 {
-    UNSUPPORTED_SYSVAR
+pub(crate) fn sol_get_fees_sysvar(var_addr: *mut u8) -> u64 {
+    SYSCALL_STUBS.read().unwrap().sol_get_fees_sysvar(var_addr)
 }
 
 pub(crate) fn sol_get_rent_sysvar(var_addr: *mut u8) -> u64 {
@@ -175,6 +185,24 @@ pub(crate) fn sol_set_return_data(data: &[u8]) {
 
 pub(crate) fn sol_log_data(data: &[&[u8]]) {
     SYSCALL_STUBS.read().unwrap().sol_log_data(data)
+}
+
+pub(crate) fn sol_get_processed_sibling_instruction(index: usize) -> Option<Instruction> {
+    SYSCALL_STUBS
+        .read()
+        .unwrap()
+        .sol_get_processed_sibling_instruction(index)
+}
+
+pub(crate) fn sol_get_stack_height() -> u64 {
+    SYSCALL_STUBS.read().unwrap().sol_get_stack_height()
+}
+
+pub(crate) fn sol_set_account_properties(updates: &[AccountPropertyUpdate]) {
+    SYSCALL_STUBS
+        .read()
+        .unwrap()
+        .sol_set_account_properties(updates)
 }
 
 /// Check that two regions do not overlap.

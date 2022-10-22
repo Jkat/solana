@@ -1,11 +1,12 @@
 use {
     crate::{
         hash::Hash,
-        instruction::{CompiledInstruction, Instruction},
+        instruction::CompiledInstruction,
         message::{
-            legacy::Message as LegacyMessage,
+            legacy,
             v0::{self, LoadedAddresses},
-            MessageHeader,
+            AccountKeys, AddressLoader, AddressLoaderError, MessageHeader,
+            SanitizedVersionedMessage, VersionedMessage,
         },
         nonce::NONCED_TX_MARKER_IX_INDEX,
         program_utils::limited_deserialize,
@@ -14,18 +15,63 @@ use {
         solana_program::{system_instruction::SystemInstruction, system_program},
         sysvar::instructions::{BorrowedAccountMeta, BorrowedInstruction},
     },
-    std::convert::TryFrom,
+    std::{borrow::Cow, convert::TryFrom},
     thiserror::Error,
 };
 
-/// Sanitized message of a transaction which includes a set of atomic
-/// instructions to be executed on-chain
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LegacyMessage<'a> {
+    /// Legacy message
+    pub message: Cow<'a, legacy::Message>,
+    /// List of boolean with same length as account_keys(), each boolean value indicates if
+    /// corresponding account key is writable or not.
+    pub is_writable_account_cache: Vec<bool>,
+}
+
+impl<'a> LegacyMessage<'a> {
+    pub fn new(message: legacy::Message) -> Self {
+        let is_writable_account_cache = message
+            .account_keys
+            .iter()
+            .enumerate()
+            .map(|(i, _key)| message.is_writable(i))
+            .collect::<Vec<_>>();
+        Self {
+            message: Cow::Owned(message),
+            is_writable_account_cache,
+        }
+    }
+
+    pub fn has_duplicates(&self) -> bool {
+        self.message.has_duplicates()
+    }
+
+    pub fn is_key_called_as_program(&self, key_index: usize) -> bool {
+        self.message.is_key_called_as_program(key_index)
+    }
+
+    /// Inspect all message keys for the bpf upgradeable loader
+    pub fn is_upgradeable_loader_present(&self) -> bool {
+        self.message.is_upgradeable_loader_present()
+    }
+
+    /// Returns the full list of account keys.
+    pub fn account_keys(&self) -> AccountKeys {
+        AccountKeys::new(&self.message.account_keys, None)
+    }
+
+    pub fn is_writable(&self, index: usize) -> bool {
+        *self.is_writable_account_cache.get(index).unwrap_or(&false)
+    }
+}
+
+/// Sanitized message of a transaction.
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum SanitizedMessage {
     /// Sanitized legacy message
-    Legacy(LegacyMessage),
+    Legacy(LegacyMessage<'static>),
     /// Sanitized version #0 message with dynamically loaded addresses
-    V0(v0::LoadedMessage),
+    V0(v0::LoadedMessage<'static>),
 }
 
 #[derive(PartialEq, Debug, Error, Eq, Clone)]
@@ -36,6 +82,8 @@ pub enum SanitizeMessageError {
     ValueOutOfBounds,
     #[error("invalid value")]
     InvalidValue,
+    #[error("{0}")]
+    AddressLoaderError(#[from] AddressLoaderError),
 }
 
 impl From<SanitizeError> for SanitizeMessageError {
@@ -48,15 +96,34 @@ impl From<SanitizeError> for SanitizeMessageError {
     }
 }
 
-impl TryFrom<LegacyMessage> for SanitizedMessage {
+impl TryFrom<legacy::Message> for SanitizedMessage {
     type Error = SanitizeMessageError;
-    fn try_from(message: LegacyMessage) -> Result<Self, Self::Error> {
+    fn try_from(message: legacy::Message) -> Result<Self, Self::Error> {
         message.sanitize()?;
-        Ok(Self::Legacy(message))
+        Ok(Self::Legacy(LegacyMessage::new(message)))
     }
 }
 
 impl SanitizedMessage {
+    /// Create a sanitized message from a sanitized versioned message.
+    /// If the input message uses address tables, attempt to look up the
+    /// address for each table index.
+    pub fn try_new(
+        sanitized_msg: SanitizedVersionedMessage,
+        address_loader: impl AddressLoader,
+    ) -> Result<Self, SanitizeMessageError> {
+        Ok(match sanitized_msg.message {
+            VersionedMessage::Legacy(message) => {
+                SanitizedMessage::Legacy(LegacyMessage::new(message))
+            }
+            VersionedMessage::V0(message) => {
+                let loaded_addresses =
+                    address_loader.load_addresses(&message.address_table_lookups)?;
+                SanitizedMessage::V0(v0::LoadedMessage::new(message, loaded_addresses))
+            }
+        })
+    }
+
     /// Return true if this message contains duplicate account keys
     pub fn has_duplicates(&self) -> bool {
         match self {
@@ -69,15 +136,15 @@ impl SanitizedMessage {
     /// readonly accounts
     pub fn header(&self) -> &MessageHeader {
         match self {
-            Self::Legacy(message) => &message.header,
-            Self::V0(message) => &message.header,
+            Self::Legacy(legacy_message) => &legacy_message.message.header,
+            Self::V0(loaded_msg) => &loaded_msg.message.header,
         }
     }
 
     /// Returns a legacy message if this sanitized message wraps one
-    pub fn legacy_message(&self) -> Option<&LegacyMessage> {
-        if let Self::Legacy(message) = &self {
-            Some(message)
+    pub fn legacy_message(&self) -> Option<&legacy::Message> {
+        if let Self::Legacy(legacy_message) = &self {
+            Some(&legacy_message.message)
         } else {
             None
         }
@@ -85,15 +152,16 @@ impl SanitizedMessage {
 
     /// Returns the fee payer for the transaction
     pub fn fee_payer(&self) -> &Pubkey {
-        self.get_account_key(0)
+        self.account_keys()
+            .get(0)
             .expect("sanitized message always has non-program fee payer at index 0")
     }
 
     /// The hash of a recent block, used for timing out a transaction
     pub fn recent_blockhash(&self) -> &Hash {
         match self {
-            Self::Legacy(message) => &message.recent_blockhash,
-            Self::V0(message) => &message.recent_blockhash,
+            Self::Legacy(legacy_message) => &legacy_message.message.recent_blockhash,
+            Self::V0(loaded_msg) => &loaded_msg.message.recent_blockhash,
         }
     }
 
@@ -101,8 +169,8 @@ impl SanitizedMessage {
     /// one atomic transaction if all succeed.
     pub fn instructions(&self) -> &[CompiledInstruction] {
         match self {
-            Self::Legacy(message) => &message.instructions,
-            Self::V0(message) => &message.instructions,
+            Self::Legacy(legacy_message) => &legacy_message.message.instructions,
+            Self::V0(loaded_msg) => &loaded_msg.message.instructions,
         }
     }
 
@@ -111,40 +179,21 @@ impl SanitizedMessage {
     pub fn program_instructions_iter(
         &self,
     ) -> impl Iterator<Item = (&Pubkey, &CompiledInstruction)> {
-        match self {
-            Self::Legacy(message) => message.instructions.iter(),
-            Self::V0(message) => message.instructions.iter(),
-        }
-        .map(move |ix| {
+        self.instructions().iter().map(move |ix| {
             (
-                self.get_account_key(usize::from(ix.program_id_index))
+                self.account_keys()
+                    .get(usize::from(ix.program_id_index))
                     .expect("program id index is sanitized"),
                 ix,
             )
         })
     }
 
-    /// Iterator of all account keys referenced in this message, including dynamically loaded keys.
-    pub fn account_keys_iter(&self) -> Box<dyn Iterator<Item = &Pubkey> + '_> {
+    /// Returns the list of account keys that are loaded for this message.
+    pub fn account_keys(&self) -> AccountKeys {
         match self {
-            Self::Legacy(message) => Box::new(message.account_keys.iter()),
-            Self::V0(message) => Box::new(message.account_keys_iter()),
-        }
-    }
-
-    /// Length of all account keys referenced in this message, including dynamically loaded keys.
-    pub fn account_keys_len(&self) -> usize {
-        match self {
-            Self::Legacy(message) => message.account_keys.len(),
-            Self::V0(message) => message.account_keys_len(),
-        }
-    }
-
-    /// Returns the address of the account at the specified index.
-    pub fn get_account_key(&self, index: usize) -> Option<&Pubkey> {
-        match self {
-            Self::Legacy(message) => message.account_keys.get(index),
-            Self::V0(message) => message.get_account_key(index),
+            Self::Legacy(message) => message.account_keys(),
+            Self::V0(message) => message.account_keys(),
         }
     }
 
@@ -209,27 +258,9 @@ impl SanitizedMessage {
             .saturating_add(usize::from(self.header().num_readonly_unsigned_accounts))
     }
 
-    fn try_position(&self, key: &Pubkey) -> Option<u8> {
-        u8::try_from(self.account_keys_iter().position(|k| k == key)?).ok()
-    }
-
-    /// Try to compile an instruction using the account keys in this message.
-    pub fn try_compile_instruction(&self, ix: &Instruction) -> Option<CompiledInstruction> {
-        let accounts: Vec<_> = ix
-            .accounts
-            .iter()
-            .map(|account_meta| self.try_position(&account_meta.pubkey))
-            .collect::<Option<_>>()?;
-
-        Some(CompiledInstruction {
-            program_id_index: self.try_position(&ix.program_id)?,
-            data: ix.data.clone(),
-            accounts,
-        })
-    }
-
     /// Decompile message instructions without cloning account keys
     pub fn decompile_instructions(&self) -> Vec<BorrowedInstruction> {
+        let account_keys = self.account_keys();
         self.program_instructions_iter()
             .map(|(program_id, instruction)| {
                 let accounts = instruction
@@ -240,7 +271,7 @@ impl SanitizedMessage {
                         BorrowedAccountMeta {
                             is_signer: self.is_signer(account_index),
                             is_writable: self.is_writable(account_index),
-                            pubkey: self.get_account_key(account_index).unwrap(),
+                            pubkey: account_keys.get(account_index).unwrap(),
                         }
                     })
                     .collect();
@@ -262,12 +293,27 @@ impl SanitizedMessage {
         }
     }
 
+    /// Get a list of signers for the instruction at the given index
+    pub fn get_ix_signers(&self, ix_index: usize) -> impl Iterator<Item = &Pubkey> {
+        self.instructions()
+            .get(ix_index)
+            .into_iter()
+            .flat_map(|ix| {
+                ix.accounts
+                    .iter()
+                    .copied()
+                    .map(usize::from)
+                    .filter(|index| self.is_signer(*index))
+                    .filter_map(|signer_index| self.account_keys().get(signer_index))
+            })
+    }
+
     /// If the message uses a durable nonce, return the pubkey of the nonce account
-    pub fn get_durable_nonce(&self, nonce_must_be_writable: bool) -> Option<&Pubkey> {
+    pub fn get_durable_nonce(&self) -> Option<&Pubkey> {
         self.instructions()
             .get(NONCED_TX_MARKER_IX_INDEX as usize)
             .filter(
-                |ix| match self.get_account_key(ix.program_id_index as usize) {
+                |ix| match self.account_keys().get(ix.program_id_index as usize) {
                     Some(program_id) => system_program::check_id(program_id),
                     _ => false,
                 },
@@ -279,12 +325,12 @@ impl SanitizedMessage {
                 )
             })
             .and_then(|ix| {
-                ix.accounts.get(0).and_then(|idx| {
+                ix.accounts.first().and_then(|idx| {
                     let idx = *idx as usize;
-                    if nonce_must_be_writable && !self.is_writable(idx) {
+                    if !self.is_writable(idx) {
                         None
                     } else {
-                        self.get_account_key(idx)
+                        self.account_keys().get(idx)
                     }
                 })
             })
@@ -293,19 +339,13 @@ impl SanitizedMessage {
 
 #[cfg(test)]
 mod tests {
-    use {
-        super::*,
-        crate::{
-            instruction::{AccountMeta, Instruction},
-            message::v0,
-        },
-    };
+    use {super::*, crate::message::v0, std::collections::HashSet};
 
     #[test]
     fn test_try_from_message() {
-        let legacy_message_with_no_signers = LegacyMessage {
+        let legacy_message_with_no_signers = legacy::Message {
             account_keys: vec![Pubkey::new_unique()],
-            ..LegacyMessage::default()
+            ..legacy::Message::default()
         };
 
         assert_eq!(
@@ -324,7 +364,7 @@ mod tests {
             CompiledInstruction::new(2, &(), vec![0, 1]),
         ];
 
-        let message = SanitizedMessage::try_from(LegacyMessage::new_with_compiled_instructions(
+        let message = SanitizedMessage::try_from(legacy::Message::new_with_compiled_instructions(
             1,
             0,
             2,
@@ -348,21 +388,21 @@ mod tests {
         let key4 = Pubkey::new_unique();
         let key5 = Pubkey::new_unique();
 
-        let legacy_message = SanitizedMessage::try_from(LegacyMessage {
+        let legacy_message = SanitizedMessage::try_from(legacy::Message {
             header: MessageHeader {
                 num_required_signatures: 2,
                 num_readonly_signed_accounts: 1,
                 num_readonly_unsigned_accounts: 1,
             },
             account_keys: vec![key0, key1, key2, key3],
-            ..LegacyMessage::default()
+            ..legacy::Message::default()
         })
         .unwrap();
 
         assert_eq!(legacy_message.num_readonly_accounts(), 2);
 
-        let v0_message = SanitizedMessage::V0(v0::LoadedMessage {
-            message: v0::Message {
+        let v0_message = SanitizedMessage::V0(v0::LoadedMessage::new(
+            v0::Message {
                 header: MessageHeader {
                     num_required_signatures: 2,
                     num_readonly_signed_accounts: 1,
@@ -371,95 +411,122 @@ mod tests {
                 account_keys: vec![key0, key1, key2, key3],
                 ..v0::Message::default()
             },
-            loaded_addresses: LoadedAddresses {
+            LoadedAddresses {
                 writable: vec![key4],
                 readonly: vec![key5],
             },
-        });
+        ));
 
         assert_eq!(v0_message.num_readonly_accounts(), 3);
     }
 
     #[test]
-    fn test_try_compile_instruction() {
+    fn test_get_ix_signers() {
+        let signer0 = Pubkey::new_unique();
+        let signer1 = Pubkey::new_unique();
+        let non_signer = Pubkey::new_unique();
+        let loader_key = Pubkey::new_unique();
+        let instructions = vec![
+            CompiledInstruction::new(3, &(), vec![2, 0]),
+            CompiledInstruction::new(3, &(), vec![0, 1]),
+            CompiledInstruction::new(3, &(), vec![0, 0]),
+        ];
+
+        let message = SanitizedMessage::try_from(legacy::Message::new_with_compiled_instructions(
+            2,
+            1,
+            2,
+            vec![signer0, signer1, non_signer, loader_key],
+            Hash::default(),
+            instructions,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            message.get_ix_signers(0).collect::<HashSet<_>>(),
+            HashSet::from_iter([&signer0])
+        );
+        assert_eq!(
+            message.get_ix_signers(1).collect::<HashSet<_>>(),
+            HashSet::from_iter([&signer0, &signer1])
+        );
+        assert_eq!(
+            message.get_ix_signers(2).collect::<HashSet<_>>(),
+            HashSet::from_iter([&signer0])
+        );
+        assert_eq!(
+            message.get_ix_signers(3).collect::<HashSet<_>>(),
+            HashSet::default()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::get_first)]
+    fn test_is_writable_account_cache() {
         let key0 = Pubkey::new_unique();
         let key1 = Pubkey::new_unique();
         let key2 = Pubkey::new_unique();
-        let program_id = Pubkey::new_unique();
+        let key3 = Pubkey::new_unique();
+        let key4 = Pubkey::new_unique();
+        let key5 = Pubkey::new_unique();
 
-        let valid_instruction = Instruction {
-            program_id,
-            accounts: vec![
-                AccountMeta::new_readonly(key0, false),
-                AccountMeta::new_readonly(key1, false),
-                AccountMeta::new_readonly(key2, false),
-            ],
-            data: vec![],
-        };
-
-        let invalid_program_id_instruction = Instruction {
-            program_id: Pubkey::new_unique(),
-            accounts: vec![
-                AccountMeta::new_readonly(key0, false),
-                AccountMeta::new_readonly(key1, false),
-                AccountMeta::new_readonly(key2, false),
-            ],
-            data: vec![],
-        };
-
-        let invalid_account_key_instruction = Instruction {
-            program_id: Pubkey::new_unique(),
-            accounts: vec![
-                AccountMeta::new_readonly(key0, false),
-                AccountMeta::new_readonly(key1, false),
-                AccountMeta::new_readonly(Pubkey::new_unique(), false),
-            ],
-            data: vec![],
-        };
-
-        let legacy_message = SanitizedMessage::try_from(LegacyMessage {
+        let legacy_message = SanitizedMessage::try_from(legacy::Message {
             header: MessageHeader {
-                num_required_signatures: 1,
-                num_readonly_signed_accounts: 0,
-                num_readonly_unsigned_accounts: 0,
+                num_required_signatures: 2,
+                num_readonly_signed_accounts: 1,
+                num_readonly_unsigned_accounts: 1,
             },
-            account_keys: vec![key0, key1, key2, program_id],
-            ..LegacyMessage::default()
+            account_keys: vec![key0, key1, key2, key3],
+            ..legacy::Message::default()
         })
         .unwrap();
+        match legacy_message {
+            SanitizedMessage::Legacy(message) => {
+                assert_eq!(
+                    message.is_writable_account_cache.len(),
+                    message.account_keys().len()
+                );
+                assert!(message.is_writable_account_cache.get(0).unwrap());
+                assert!(!message.is_writable_account_cache.get(1).unwrap());
+                assert!(message.is_writable_account_cache.get(2).unwrap());
+                assert!(!message.is_writable_account_cache.get(3).unwrap());
+            }
+            _ => {
+                panic!("Expect to be SanitizedMessage::LegacyMessage")
+            }
+        }
 
-        let v0_message = SanitizedMessage::V0(v0::LoadedMessage {
-            message: v0::Message {
+        let v0_message = SanitizedMessage::V0(v0::LoadedMessage::new(
+            v0::Message {
                 header: MessageHeader {
-                    num_required_signatures: 1,
-                    num_readonly_signed_accounts: 0,
-                    num_readonly_unsigned_accounts: 0,
+                    num_required_signatures: 2,
+                    num_readonly_signed_accounts: 1,
+                    num_readonly_unsigned_accounts: 1,
                 },
-                account_keys: vec![key0, key1],
+                account_keys: vec![key0, key1, key2, key3],
                 ..v0::Message::default()
             },
-            loaded_addresses: LoadedAddresses {
-                writable: vec![key2],
-                readonly: vec![program_id],
+            LoadedAddresses {
+                writable: vec![key4],
+                readonly: vec![key5],
             },
-        });
-
-        for message in vec![legacy_message, v0_message] {
-            assert_eq!(
-                message.try_compile_instruction(&valid_instruction),
-                Some(CompiledInstruction {
-                    program_id_index: 3,
-                    accounts: vec![0, 1, 2],
-                    data: vec![],
-                })
-            );
-
-            assert!(message
-                .try_compile_instruction(&invalid_program_id_instruction)
-                .is_none());
-            assert!(message
-                .try_compile_instruction(&invalid_account_key_instruction)
-                .is_none());
+        ));
+        match v0_message {
+            SanitizedMessage::V0(message) => {
+                assert_eq!(
+                    message.is_writable_account_cache.len(),
+                    message.account_keys().len()
+                );
+                assert!(message.is_writable_account_cache.get(0).unwrap());
+                assert!(!message.is_writable_account_cache.get(1).unwrap());
+                assert!(message.is_writable_account_cache.get(2).unwrap());
+                assert!(!message.is_writable_account_cache.get(3).unwrap());
+                assert!(message.is_writable_account_cache.get(4).unwrap());
+                assert!(!message.is_writable_account_cache.get(5).unwrap());
+            }
+            _ => {
+                panic!("Expect to be SanitizedMessage::V0")
+            }
         }
     }
 }

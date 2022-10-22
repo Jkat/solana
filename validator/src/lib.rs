@@ -1,8 +1,11 @@
 #![allow(clippy::integer_arithmetic)]
+pub use solana_test_validator as test_validator;
 use {
     console::style,
     fd_lock::{RwLock, RwLockWriteGuard},
     indicatif::{ProgressDrawTarget, ProgressStyle},
+    solana_net_utils::MINIMUM_VALIDATOR_PORT_RANGE_WIDTH,
+    solana_sdk::quic::QUIC_PORT_OFFSET,
     std::{
         borrow::Cow,
         env,
@@ -11,11 +14,8 @@ use {
         path::Path,
         process::exit,
         thread::JoinHandle,
+        time::Duration,
     },
-};
-pub use {
-    solana_gossip::cluster_info::MINIMUM_VALIDATOR_PORT_RANGE_WIDTH,
-    solana_test_validator as test_validator,
 };
 
 pub mod admin_rpc_service;
@@ -58,7 +58,7 @@ pub fn redirect_stderr_to_file(logfile: Option<String>) -> Option<JoinHandle<()>
             {
                 use log::info;
                 let mut signals =
-                    signal_hook::iterator::Signals::new(&[signal_hook::consts::SIGUSR1])
+                    signal_hook::iterator::Signals::new([signal_hook::consts::SIGUSR1])
                         .unwrap_or_else(|err| {
                             eprintln!("Unable to register SIGUSR1 handler: {:?}", err);
                             exit(1);
@@ -66,15 +66,20 @@ pub fn redirect_stderr_to_file(logfile: Option<String>) -> Option<JoinHandle<()>
 
                 solana_logger::setup_with_default(filter);
                 redirect_stderr(&logfile);
-                Some(std::thread::spawn(move || {
-                    for signal in signals.forever() {
-                        info!(
-                            "received SIGUSR1 ({}), reopening log file: {:?}",
-                            signal, logfile
-                        );
-                        redirect_stderr(&logfile);
-                    }
-                }))
+                Some(
+                    std::thread::Builder::new()
+                        .name("solSigUsr1".into())
+                        .spawn(move || {
+                            for signal in signals.forever() {
+                                info!(
+                                    "received SIGUSR1 ({}), reopening log file: {:?}",
+                                    signal, logfile
+                                );
+                                redirect_stderr(&logfile);
+                            }
+                        })
+                        .unwrap(),
+                )
             }
             #[cfg(not(unix))]
             {
@@ -100,6 +105,8 @@ pub fn port_range_validator(port_range: String) -> Result<(), String> {
                 start,
                 start + MINIMUM_VALIDATOR_PORT_RANGE_WIDTH
             ))
+        } else if end.checked_add(QUIC_PORT_OFFSET).is_none() {
+            Err("Invalid dynamic_port_range.".to_string())
         } else {
             Ok(())
         }
@@ -108,18 +115,24 @@ pub fn port_range_validator(port_range: String) -> Result<(), String> {
     }
 }
 
+pub fn format_name_value(name: &str, value: &str) -> String {
+    format!("{} {}", style(name).bold(), value)
+}
 /// Pretty print a "name value"
 pub fn println_name_value(name: &str, value: &str) {
-    println!("{} {}", style(name).bold(), value);
+    println!("{}", format_name_value(name, value));
 }
 
 /// Creates a new process bar for processing that will take an unknown amount of time
 pub fn new_spinner_progress_bar() -> ProgressBar {
     let progress_bar = indicatif::ProgressBar::new(42);
     progress_bar.set_draw_target(ProgressDrawTarget::stdout());
-    progress_bar
-        .set_style(ProgressStyle::default_spinner().template("{spinner:.green} {wide_msg}"));
-    progress_bar.enable_steady_tick(100);
+    progress_bar.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {wide_msg}")
+            .expect("ProgresStyle::template direct input to be correct"),
+    );
+    progress_bar.enable_steady_tick(Duration::from_millis(100));
 
     ProgressBar {
         progress_bar,
@@ -139,6 +152,10 @@ impl ProgressBar {
         } else {
             println!("{}", msg);
         }
+    }
+
+    pub fn println<I: AsRef<str>>(&self, msg: I) {
+        self.progress_bar.println(msg);
     }
 
     pub fn abandon_with_message<T: Into<Cow<'static, str>> + Display>(&self, msg: T) {

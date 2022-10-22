@@ -1,10 +1,15 @@
 //! Errors related to proving and verifying proofs.
-use crate::{range_proof::errors::RangeProofError, sigma_proofs::errors::*};
-use thiserror::Error;
+use {
+    crate::{range_proof::errors::RangeProofError, sigma_proofs::errors::*},
+    thiserror::Error,
+};
 
-// TODO: clean up errors for encryption
 #[derive(Error, Clone, Debug, Eq, PartialEq)]
 pub enum ProofError {
+    #[error("invalid transfer amount range")]
+    TransferAmount,
+    #[error("proof generation failed")]
+    Generation,
     #[error("proof failed to verify")]
     Verification,
     #[error("range proof failed to verify")]
@@ -17,10 +22,12 @@ pub enum ProofError {
     ZeroBalanceProof,
     #[error("validity proof failed to verify")]
     ValidityProof,
-    #[error(
-        "`zk_token_elgamal::pod::ElGamalCiphertext` contains invalid ElGamalCiphertext ciphertext"
-    )]
-    InconsistentCTData,
+    #[error("public-key sigma proof failed to verify")]
+    PubkeySigmaProof,
+    #[error("failed to decrypt ciphertext")]
+    Decryption,
+    #[error("invalid ciphertext data")]
+    CiphertextDeserialization,
 }
 
 #[derive(Error, Clone, Debug, Eq, PartialEq)]
@@ -41,8 +48,8 @@ impl From<EqualityProofError> for ProofError {
     }
 }
 
-impl From<FeeProofError> for ProofError {
-    fn from(_err: FeeProofError) -> Self {
+impl From<FeeSigmaProofError> for ProofError {
+    fn from(_err: FeeSigmaProofError) -> Self {
         Self::FeeProof
     }
 }
@@ -55,5 +62,11 @@ impl From<ZeroBalanceProofError> for ProofError {
 impl From<ValidityProofError> for ProofError {
     fn from(_err: ValidityProofError) -> Self {
         Self::ValidityProof
+    }
+}
+
+impl From<PubkeySigmaProofError> for ProofError {
+    fn from(_err: PubkeySigmaProofError) -> Self {
+        Self::PubkeySigmaProof
     }
 }

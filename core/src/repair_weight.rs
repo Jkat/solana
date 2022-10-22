@@ -310,8 +310,7 @@ impl RepairWeight {
         // Purge `self.unrooted_slots` of slots less than `new_root` as we know any
         // unrooted votes for slots < `new_root` will now be rejected, so we won't
         // need to check `self.unrooted_slots` to see if those slots are unrooted.
-        let mut new_unrooted_slots = self.unrooted_slots.split_off(&new_root);
-        std::mem::swap(&mut self.unrooted_slots, &mut new_unrooted_slots);
+        self.unrooted_slots = self.unrooted_slots.split_off(&new_root);
         self.root = new_root;
     }
 
@@ -476,14 +475,9 @@ impl RepairWeight {
                     .get_mut(&orphan_tree_root)
                     .expect("Orphan must exist");
 
-                let num_skip = if parent_tree_root.is_some() {
-                    // Skip the leaf of the parent tree that the
-                    // orphan would merge with later in a call
-                    // to `merge_trees`
-                    1
-                } else {
-                    0
-                };
+                // Skip the leaf of the parent tree that the orphan would merge
+                // with later in a call to `merge_trees`
+                let num_skip = usize::from(parent_tree_root.is_some());
 
                 for ancestor in new_ancestors.iter().skip(num_skip).rev() {
                     self.slot_to_tree.insert(*ancestor, orphan_tree_root);
@@ -642,7 +636,7 @@ impl RepairWeight {
     }
 
     // Heavier, smaller slots come first
-    fn sort_by_stake_weight_slot(slot_stake_voted: &mut Vec<(Slot, u64)>) {
+    fn sort_by_stake_weight_slot(slot_stake_voted: &mut [(Slot, u64)]) {
         slot_stake_voted.sort_by(|(slot, stake_voted), (slot_, stake_voted_)| {
             if stake_voted == stake_voted_ {
                 slot.cmp(slot_)

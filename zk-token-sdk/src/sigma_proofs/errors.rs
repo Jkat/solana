@@ -1,6 +1,5 @@
 //! Errors related to proving and verifying sigma proofs.
-use crate::errors::TranscriptError;
-use thiserror::Error;
+use {crate::errors::TranscriptError, thiserror::Error};
 
 #[derive(Error, Clone, Debug, Eq, PartialEq)]
 pub enum EqualityProofError {
@@ -57,7 +56,7 @@ impl From<TranscriptError> for ZeroBalanceProofError {
 }
 
 #[derive(Error, Clone, Debug, Eq, PartialEq)]
-pub enum FeeProofError {
+pub enum FeeSigmaProofError {
     #[error("the required algebraic relation does not hold")]
     AlgebraicRelation,
     #[error("malformed proof")]
@@ -68,7 +67,25 @@ pub enum FeeProofError {
     Transcript,
 }
 
-impl From<TranscriptError> for FeeProofError {
+impl From<TranscriptError> for FeeSigmaProofError {
+    fn from(_err: TranscriptError) -> Self {
+        Self::Transcript
+    }
+}
+
+#[derive(Error, Clone, Debug, Eq, PartialEq)]
+pub enum PubkeySigmaProofError {
+    #[error("the required algebraic relation does not hold")]
+    AlgebraicRelation,
+    #[error("malformed proof")]
+    Format,
+    #[error("multiscalar multiplication failed")]
+    MultiscalarMul,
+    #[error("transcript failed to produce a challenge")]
+    Transcript,
+}
+
+impl From<TranscriptError> for PubkeySigmaProofError {
     fn from(_err: TranscriptError) -> Self {
         Self::Transcript
     }

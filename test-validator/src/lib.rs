@@ -1,8 +1,9 @@
 #![allow(clippy::integer_arithmetic)]
+
 use {
     log::*,
     solana_cli_output::CliAccount,
-    solana_client::{nonblocking, rpc_client::RpcClient},
+    solana_client::rpc_request::MAX_MULTIPLE_ACCOUNTS,
     solana_core::{
         tower_storage::TowerStorage,
         validator::{Validator, ValidatorConfig, ValidatorStartProgress},
@@ -12,12 +13,19 @@ use {
         gossip_service::discover_cluster,
         socketaddr,
     },
-    solana_ledger::{blockstore::create_new_ledger, create_new_tmp_ledger},
+    solana_ledger::{
+        blockstore::create_new_ledger, blockstore_options::LedgerColumnOptions,
+        create_new_tmp_ledger,
+    },
     solana_net_utils::PortRange,
+    solana_program_runtime::compute_budget::ComputeBudget,
     solana_rpc::{rpc::JsonRpcConfig, rpc_pubsub_service::PubSubConfig},
+    solana_rpc_client::{nonblocking, rpc_client::RpcClient},
     solana_runtime::{
+        accounts_db::AccountsDbConfig, accounts_index::AccountsIndexConfig, bank_forks::BankForks,
         genesis_utils::create_genesis_config_with_leader_ex,
-        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, snapshot_config::SnapshotConfig,
+        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, runtime_config::RuntimeConfig,
+        snapshot_config::SnapshotConfig,
     },
     solana_sdk::{
         account::{Account, AccountSharedData},
@@ -25,6 +33,7 @@ use {
         commitment_config::CommitmentConfig,
         epoch_schedule::EpochSchedule,
         exit::Exit,
+        feature_set::FEATURE_NAMES,
         fee_calculator::{FeeCalculator, FeeRateGovernor},
         hash::Hash,
         instruction::{AccountMeta, Instruction},
@@ -35,9 +44,14 @@ use {
         signature::{read_keypair_file, write_keypair_file, Keypair, Signer},
     },
     solana_streamer::socket::SocketAddrSpace,
+    solana_tpu_client::connection_cache::{
+        DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_TPU_ENABLE_UDP, DEFAULT_TPU_USE_QUIC,
+    },
     std::{
-        collections::HashMap,
-        fs::{remove_dir_all, File},
+        collections::{HashMap, HashSet},
+        ffi::OsStr,
+        fmt::Display,
+        fs::{self, remove_dir_all, File},
         io::Read,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
@@ -50,7 +64,7 @@ use {
 
 #[derive(Clone)]
 pub struct AccountInfo<'a> {
-    pub address: Pubkey,
+    pub address: Option<Pubkey>,
     pub filename: &'a str,
 }
 
@@ -84,7 +98,6 @@ impl Default for TestValidatorNodeConfig {
     }
 }
 
-#[derive(Default)]
 pub struct TestValidatorGenesis {
     fee_rate_governor: FeeRateGovernor,
     ledger_path: Option<PathBuf>,
@@ -103,13 +116,60 @@ pub struct TestValidatorGenesis {
     pub validator_exit: Arc<RwLock<Exit>>,
     pub start_progress: Arc<RwLock<ValidatorStartProgress>>,
     pub authorized_voter_keypairs: Arc<RwLock<Vec<Arc<Keypair>>>>,
+    pub staked_nodes_overrides: Arc<RwLock<HashMap<Pubkey, u64>>>,
     pub max_ledger_shreds: Option<u64>,
     pub max_genesis_archive_unpacked_size: Option<u64>,
-    pub accountsdb_plugin_config_files: Option<Vec<PathBuf>>,
+    pub geyser_plugin_config_files: Option<Vec<PathBuf>>,
     pub accounts_db_caching_enabled: bool,
+    deactivate_feature_set: HashSet<Pubkey>,
+    compute_unit_limit: Option<u64>,
+    pub log_messages_bytes_limit: Option<usize>,
+    pub transaction_account_lock_limit: Option<usize>,
+    pub tpu_enable_udp: bool,
+}
+
+impl Default for TestValidatorGenesis {
+    fn default() -> Self {
+        Self {
+            fee_rate_governor: FeeRateGovernor::default(),
+            ledger_path: Option::<PathBuf>::default(),
+            tower_storage: Option::<Arc<dyn TowerStorage>>::default(),
+            rent: Rent::default(),
+            rpc_config: JsonRpcConfig::default_for_test(),
+            pubsub_config: PubSubConfig::default(),
+            rpc_ports: Option::<(u16, u16)>::default(),
+            warp_slot: Option::<Slot>::default(),
+            no_bpf_jit: bool::default(),
+            accounts: HashMap::<Pubkey, AccountSharedData>::default(),
+            programs: Vec::<ProgramInfo>::default(),
+            ticks_per_slot: Option::<u64>::default(),
+            epoch_schedule: Option::<EpochSchedule>::default(),
+            node_config: TestValidatorNodeConfig::default(),
+            validator_exit: Arc::<RwLock<Exit>>::default(),
+            start_progress: Arc::<RwLock<ValidatorStartProgress>>::default(),
+            authorized_voter_keypairs: Arc::<RwLock<Vec<Arc<Keypair>>>>::default(),
+            staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
+            max_ledger_shreds: Option::<u64>::default(),
+            max_genesis_archive_unpacked_size: Option::<u64>::default(),
+            geyser_plugin_config_files: Option::<Vec<PathBuf>>::default(),
+            accounts_db_caching_enabled: bool::default(),
+            deactivate_feature_set: HashSet::<Pubkey>::default(),
+            compute_unit_limit: Option::<u64>::default(),
+            log_messages_bytes_limit: Option::<usize>::default(),
+            transaction_account_lock_limit: Option::<usize>::default(),
+            tpu_enable_udp: DEFAULT_TPU_ENABLE_UDP,
+        }
+    }
 }
 
 impl TestValidatorGenesis {
+    /// Adds features to deactivate to a set, eliminating redundancies
+    /// during `initialize_ledger`, if member of the set is not a Feature
+    /// it will be silently ignored
+    pub fn deactivate_features(&mut self, deactivate_list: &[Pubkey]) -> &mut Self {
+        self.deactivate_feature_set.extend(deactivate_list);
+        self
+    }
     pub fn ledger_path<P: Into<PathBuf>>(&mut self, ledger_path: P) -> &mut Self {
         self.ledger_path = Some(ledger_path.into());
         self
@@ -123,6 +183,11 @@ impl TestValidatorGenesis {
     /// Check if a given TestValidator ledger has already been initialized
     pub fn ledger_exists(ledger_path: &Path) -> bool {
         ledger_path.join("vote-account-keypair.json").exists()
+    }
+
+    pub fn tpu_enable_udp(&mut self, tpu_enable_udp: bool) -> &mut Self {
+        self.tpu_enable_udp = tpu_enable_udp;
+        self
     }
 
     pub fn fee_rate_governor(&mut self, fee_rate_governor: FeeRateGovernor) -> &mut Self {
@@ -195,6 +260,16 @@ impl TestValidatorGenesis {
         self
     }
 
+    pub fn compute_unit_limit(&mut self, compute_unit_limit: u64) -> &mut Self {
+        self.compute_unit_limit = Some(compute_unit_limit);
+        self
+    }
+
+    #[deprecated(note = "Please use `compute_unit_limit` instead")]
+    pub fn max_compute_units(&mut self, max_compute_units: u64) -> &mut Self {
+        self.compute_unit_limit(max_compute_units)
+    }
+
     /// Add an account to the test environment
     pub fn add_account(&mut self, address: Pubkey, account: AccountSharedData) -> &mut Self {
         self.accounts.insert(address, account);
@@ -211,28 +286,43 @@ impl TestValidatorGenesis {
         self
     }
 
-    pub fn clone_accounts<T>(&mut self, addresses: T, rpc_client: &RpcClient) -> &mut Self
+    pub fn clone_accounts<T>(
+        &mut self,
+        addresses: T,
+        rpc_client: &RpcClient,
+        skip_missing: bool,
+    ) -> Result<&mut Self, String>
     where
         T: IntoIterator<Item = Pubkey>,
     {
-        for address in addresses {
-            info!("Fetching {} over RPC...", address);
-            let account = rpc_client.get_account(&address).unwrap_or_else(|err| {
-                error!("Failed to fetch {}: {}", address, err);
-                solana_core::validator::abort();
-            });
-            self.add_account(address, AccountSharedData::from(account));
+        let addresses: Vec<Pubkey> = addresses.into_iter().collect();
+        for chunk in addresses.chunks(MAX_MULTIPLE_ACCOUNTS) {
+            info!("Fetching {:?} over RPC...", chunk);
+            let responses = rpc_client
+                .get_multiple_accounts(chunk)
+                .map_err(|err| format!("Failed to fetch: {}", err))?;
+            for (address, res) in chunk.iter().zip(responses) {
+                if let Some(account) = res {
+                    self.add_account(*address, AccountSharedData::from(account));
+                } else if skip_missing {
+                    warn!("Could not find {}, skipping.", address);
+                } else {
+                    return Err(format!("Failed to fetch {}", address));
+                }
+            }
         }
-        self
+        Ok(self)
     }
 
-    pub fn add_accounts_from_json_files(&mut self, accounts: &[AccountInfo]) -> &mut Self {
+    pub fn add_accounts_from_json_files(
+        &mut self,
+        accounts: &[AccountInfo],
+    ) -> Result<&mut Self, String> {
         for account in accounts {
-            let account_path =
-                solana_program_test::find_file(account.filename).unwrap_or_else(|| {
-                    error!("Unable to locate {}", account.filename);
-                    solana_core::validator::abort();
-                });
+            let account_path = match solana_program_test::find_file(account.filename) {
+                Some(path) => path,
+                None => return Err(format!("Unable to locate {}", account.filename)),
+            };
             let mut file = File::open(&account_path).unwrap();
             let mut account_info_raw = String::new();
             file.read_to_string(&mut account_info_raw).unwrap();
@@ -240,16 +330,18 @@ impl TestValidatorGenesis {
             let result: serde_json::Result<CliAccount> = serde_json::from_str(&account_info_raw);
             let account_info = match result {
                 Err(err) => {
-                    error!(
+                    return Err(format!(
                         "Unable to deserialize {}: {}",
                         account_path.to_str().unwrap(),
                         err
-                    );
-                    solana_core::validator::abort();
+                    ));
                 }
                 Ok(deserialized) => deserialized,
             };
-            let address = Pubkey::from_str(account_info.keyed_account.pubkey.as_str()).unwrap();
+
+            let address = account.address.unwrap_or_else(|| {
+                Pubkey::from_str(account_info.keyed_account.pubkey.as_str()).unwrap()
+            });
             let account = account_info
                 .keyed_account
                 .account
@@ -258,7 +350,41 @@ impl TestValidatorGenesis {
 
             self.add_account(address, account);
         }
-        self
+        Ok(self)
+    }
+
+    pub fn add_accounts_from_directories<T, P>(&mut self, dirs: T) -> Result<&mut Self, String>
+    where
+        T: IntoIterator<Item = P>,
+        P: AsRef<Path> + Display,
+    {
+        let mut json_files: HashSet<String> = HashSet::new();
+        for dir in dirs {
+            let matched_files = match fs::read_dir(&dir) {
+                Ok(dir) => dir,
+                Err(e) => return Err(format!("Cannot read directory {}: {}", &dir, e)),
+            }
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file() && path.extension() == Some(OsStr::new("json")))
+            .map(|path| String::from(path.to_string_lossy()));
+
+            json_files.extend(matched_files);
+        }
+
+        debug!("account files found: {:?}", json_files);
+
+        let accounts: Vec<_> = json_files
+            .iter()
+            .map(|filename| AccountInfo {
+                address: None,
+                filename,
+            })
+            .collect();
+
+        self.add_accounts_from_json_files(&accounts)?;
+
+        Ok(self)
     }
 
     /// Add an account to the test environment with the account data in the provided `filename`
@@ -340,7 +466,15 @@ impl TestValidatorGenesis {
         mint_address: Pubkey,
         socket_addr_space: SocketAddrSpace,
     ) -> Result<TestValidator, Box<dyn std::error::Error>> {
-        TestValidator::start(mint_address, self, socket_addr_space)
+        TestValidator::start(mint_address, self, socket_addr_space).map(|test_validator| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(test_validator.wait_for_nonzero_fees());
+            test_validator
+        })
     }
 
     /// Start a test validator
@@ -364,18 +498,9 @@ impl TestValidatorGenesis {
         socket_addr_space: SocketAddrSpace,
     ) -> (TestValidator, Keypair) {
         let mint_keypair = Keypair::new();
-        match TestValidator::start(mint_keypair.pubkey(), self, socket_addr_space) {
-            Ok(test_validator) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
-                    .enable_time()
-                    .build()
-                    .unwrap();
-                runtime.block_on(test_validator.wait_for_nonzero_fees());
-                (test_validator, mint_keypair)
-            }
-            Err(err) => panic!("Test validator failed to start: {}", err),
-        }
+        self.start_with_mint_address(mint_keypair.pubkey(), socket_addr_space)
+            .map(|test_validator| (test_validator, mint_keypair))
+            .unwrap_or_else(|err| panic!("Test validator failed to start: {}", err))
     }
 
     pub async fn start_async(&self) -> (TestValidator, Keypair) {
@@ -433,6 +558,25 @@ impl TestValidator {
             .expect("validator start failed")
     }
 
+    /// Create a test validator using udp for TPU.
+    pub fn with_no_fees_udp(
+        mint_address: Pubkey,
+        faucet_addr: Option<SocketAddr>,
+        socket_addr_space: SocketAddrSpace,
+    ) -> Self {
+        TestValidatorGenesis::default()
+            .tpu_enable_udp(true)
+            .fee_rate_governor(FeeRateGovernor::new(0, 0))
+            .rent(Rent {
+                lamports_per_byte_year: 1,
+                exemption_threshold: 1.0,
+                ..Rent::default()
+            })
+            .faucet_addr(faucet_addr)
+            .start_with_mint_address(mint_address, socket_addr_space)
+            .expect("validator start failed")
+    }
+
     /// Create and start a `TestValidator` with custom transaction fees and minimal rent.
     /// Faucet optional.
     ///
@@ -453,6 +597,15 @@ impl TestValidator {
             .faucet_addr(faucet_addr)
             .start_with_mint_address(mint_address, socket_addr_space)
             .expect("validator start failed")
+    }
+
+    /// allow tests to indicate that validator has completed initialization
+    pub fn set_startup_verification_complete_for_tests(&self) {
+        self.bank_forks()
+            .read()
+            .unwrap()
+            .root_bank()
+            .set_startup_verification_complete();
     }
 
     /// Initialize the ledger directory
@@ -511,6 +664,24 @@ impl TestValidator {
             genesis_config.ticks_per_slot = ticks_per_slot;
         }
 
+        // Remove features tagged to deactivate
+        for deactivate_feature_pk in &config.deactivate_feature_set {
+            if FEATURE_NAMES.contains_key(deactivate_feature_pk) {
+                match genesis_config.accounts.remove(deactivate_feature_pk) {
+                    Some(_) => info!("Feature for {:?} deactivated", deactivate_feature_pk),
+                    None => warn!(
+                        "Feature {:?} set for deactivation not found in genesis_config account list, ignored.",
+                        deactivate_feature_pk
+                    ),
+                }
+            } else {
+                warn!(
+                    "Feature {:?} set for deactivation is not a known Feature public key",
+                    deactivate_feature_pk
+                );
+            }
+        }
+
         let ledger_path = match &config.ledger_path {
             None => create_new_tmp_ledger!(&genesis_config).0,
             Some(ledger_path) => {
@@ -524,7 +695,7 @@ impl TestValidator {
                     config
                         .max_genesis_archive_unpacked_size
                         .unwrap_or(MAX_GENESIS_ARCHIVE_UNPACKED_SIZE),
-                    solana_ledger::blockstore_db::AccessType::PrimaryOnly,
+                    LedgerColumnOptions::default(),
                 )
                 .map_err(|err| {
                     format!(
@@ -601,8 +772,28 @@ impl TestValidator {
             }
         }
 
+        let accounts_db_config = Some(AccountsDbConfig {
+            index: Some(AccountsIndexConfig {
+                started_from_validator: true,
+                ..AccountsIndexConfig::default()
+            }),
+            ..AccountsDbConfig::default()
+        });
+
+        let runtime_config = RuntimeConfig {
+            bpf_jit: !config.no_bpf_jit,
+            compute_budget: config
+                .compute_unit_limit
+                .map(|compute_unit_limit| ComputeBudget {
+                    compute_unit_limit,
+                    ..ComputeBudget::default()
+                }),
+            log_messages_bytes_limit: config.log_messages_bytes_limit,
+            transaction_account_lock_limit: config.transaction_account_lock_limit,
+        };
+
         let mut validator_config = ValidatorConfig {
-            accountsdb_plugin_config_files: config.accountsdb_plugin_config_files.clone(),
+            geyser_plugin_config_files: config.geyser_plugin_config_files.clone(),
             accounts_db_caching_enabled: config.accounts_db_caching_enabled,
             rpc_addrs: Some((
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), node.info.rpc.port()),
@@ -620,17 +811,20 @@ impl TestValidator {
                 full_snapshot_archive_interval_slots: 100,
                 incremental_snapshot_archive_interval_slots: Slot::MAX,
                 bank_snapshots_dir: ledger_path.join("snapshot"),
-                snapshot_archives_dir: ledger_path.to_path_buf(),
+                full_snapshot_archives_dir: ledger_path.to_path_buf(),
+                incremental_snapshot_archives_dir: ledger_path.to_path_buf(),
                 ..SnapshotConfig::default()
             }),
             enforce_ulimit_nofile: false,
             warp_slot: config.warp_slot,
-            bpf_jit: !config.no_bpf_jit,
             validator_exit: config.validator_exit.clone(),
             rocksdb_compaction_interval: Some(100), // Compact every 100 slots
             max_ledger_shreds: config.max_ledger_shreds,
             no_wait_for_vote_to_start_leader: true,
-            ..ValidatorConfig::default()
+            staked_nodes_overrides: config.staked_nodes_overrides.clone(),
+            accounts_db_config,
+            runtime_config,
+            ..ValidatorConfig::default_for_test()
         };
         if let Some(ref tower_storage) = config.tower_storage {
             validator_config.tower_storage = tower_storage.clone();
@@ -647,7 +841,10 @@ impl TestValidator {
             true, // should_check_duplicate_instance
             config.start_progress.clone(),
             socket_addr_space,
-        ));
+            DEFAULT_TPU_USE_QUIC,
+            DEFAULT_TPU_CONNECTION_POOL_SIZE,
+            config.tpu_enable_udp,
+        )?);
 
         // Needed to avoid panics in `solana-responder-gossip` in tests that create a number of
         // test validators concurrently...
@@ -776,6 +973,10 @@ impl TestValidator {
     pub fn cluster_info(&self) -> Arc<ClusterInfo> {
         self.validator.as_ref().unwrap().cluster_info.clone()
     }
+
+    pub fn bank_forks(&self) -> Arc<RwLock<BankForks>> {
+        self.validator.as_ref().unwrap().bank_forks.clone()
+    }
 }
 
 impl Drop for TestValidator {
@@ -802,6 +1003,7 @@ mod test {
     #[test]
     fn get_health() {
         let (test_validator, _payer) = TestValidatorGenesis::default().start();
+        test_validator.set_startup_verification_complete_for_tests();
         let rpc_client = test_validator.get_rpc_client();
         rpc_client.get_health().expect("health");
     }
@@ -809,6 +1011,7 @@ mod test {
     #[tokio::test]
     async fn nonblocking_get_health() {
         let (test_validator, _payer) = TestValidatorGenesis::default().start_async().await;
+        test_validator.set_startup_verification_complete_for_tests();
         let rpc_client = test_validator.get_async_rpc_client();
         rpc_client.get_health().await.expect("health");
     }
